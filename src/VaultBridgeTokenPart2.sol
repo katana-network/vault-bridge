@@ -256,19 +256,15 @@ contract VaultBridgeTokenPart2 is VaultBridgeToken {
             shares = originalYieldVaultSharesBalance;
         }
 
-        uint256 maxShares = $.yieldVault.maxRedeem(address(this));
-
-        if (exact) {
-            require(shares <= maxShares, YieldVaultRedemptionFailed(shares, maxShares));
-        }
-
-        shares = shares > maxShares ? maxShares : shares;
-
         if (shares == 0) return;
 
         uint256 balanceBefore = $.underlyingToken.balanceOf(address(this));
 
-        $.yieldVault.redeem(shares, address(this), address(this));
+        try $.yieldVault.redeem(shares, address(this), address(this)) returns (uint256) {}
+        catch {
+            if (exact) revert YieldVaultRedemptionFailed(shares, _yieldVaultCapacity());
+            return;
+        }
 
         uint256 balanceAfter = $.underlyingToken.balanceOf(address(this));
 
@@ -281,7 +277,9 @@ contract VaultBridgeTokenPart2 is VaultBridgeToken {
         require(
             Math.mulDiv(originalYieldVaultSharesBalance, receivedAssets, shares)
                 >= Math.mulDiv(
-                    convertToAssets(originalTotalSupply) - originalReservedAssets,
+                    convertToAssets(originalTotalSupply) > originalReservedAssets
+                        ? convertToAssets(originalTotalSupply) - originalReservedAssets
+                        : 0,
                     1e18 - $.yieldVaultMaximumSlippagePercentage,
                     1e18
                 ),
@@ -356,6 +354,6 @@ contract VaultBridgeTokenPart2 is VaultBridgeToken {
 
     /// @inheritdoc IVersioned
     function version() external pure override returns (string memory) {
-        return "0.5.0";
+        return "0.6.0";
     }
 }

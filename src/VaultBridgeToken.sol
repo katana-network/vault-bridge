@@ -17,6 +17,7 @@ import {ReentrancyGuardTransientUpgradeable} from
     "@openzeppelin-contracts-upgradeable/utils/ReentrancyGuardTransientUpgradeable.sol";
 import {ERC20PermitUser} from "./etc/ERC20PermitUser.sol";
 import {IVersioned} from "./etc/IVersioned.sol";
+import {ILiquidityLens} from "./etc/ILiquidityLens.sol";
 
 // Libraries.
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -67,6 +68,7 @@ abstract contract VaultBridgeToken is
         address migrationManager;
         uint256 yieldVaultMaximumSlippagePercentage;
         address _vaultBridgeTokenPart2;
+        address liquidityLens;
     }
 
     /// @remind Document.
@@ -157,6 +159,8 @@ abstract contract VaultBridgeToken is
     event YieldVaultDrained(uint256 redeemedShares, uint256 receivedAssets);
     event YieldVaultSet(address yieldVault);
     event YieldVaultMaximumSlippagePercentageSet(uint256 slippagePercentage);
+    event LiquidityLensSet(address liquidityLens);
+    event VaultBridgeTokenPart2Set(address vaultBridgeTokenPart2);
 
     // -----================= ::: MODIFIERS ::: =================-----
 
@@ -602,7 +606,11 @@ abstract contract VaultBridgeToken is
         remainingAssets -= $.reservedAssets;
 
         // Simulate withdrawal from the yield vault.
-        uint256 maxWithdraw_ = $.yieldVault.maxWithdraw(address(this));
+        uint256 maxWithdraw_ = _yieldVaultCapacity();
+        if (maxWithdraw_ == 0) {
+            if (force) revert AssetsTooLarge($.reservedAssets, assets);
+            return $.reservedAssets;
+        }
         maxWithdraw_ = remainingAssets > maxWithdraw_ ? maxWithdraw_ : remainingAssets;
         uint256 burnedYieldVaultShares;
         try $.yieldVault.previewWithdraw(maxWithdraw_) returns (uint256 shares) {
@@ -688,26 +696,15 @@ abstract contract VaultBridgeToken is
 
         if (remainingAssets != 0) {
             // Calculate the amount to withdraw from the yield vault.
-            uint256 maxWithdraw_ = $.yieldVault.maxWithdraw(address(this));
-
-            // Withdraw the underlying token from the yield vault.
-            if (maxWithdraw_ >= remainingAssets) {
-                // Withdraw to this contract.
-                (, receivedAssets) = _withdrawFromYieldVault(
-                    remainingAssets,
-                    true,
-                    address(this),
-                    originalTotalSupply,
-                    originalUncollectedYield,
-                    originalReservedAssets
-                );
-            } else {
-                // Update the remaining assets.
-                remainingAssets -= maxWithdraw_;
-
-                // Revert because all of the `assets` could not be withdrawn.
-                revert AssetsTooLarge(assets - remainingAssets, assets);
-            }
+            // Attempt directly. The yield vault is the authority; a failure reverts inside.
+            (, receivedAssets) = _withdrawFromYieldVault(
+                remainingAssets,
+                true,
+                address(this),
+                originalTotalSupply,
+                originalUncollectedYield,
+                originalReservedAssets
+            );
         }
 
         // Burn vbToken.
@@ -986,20 +983,9 @@ abstract contract VaultBridgeToken is
         // @remind Document.
         uint256 originalAssets = assets;
 
-        // Get the yield vault's deposit limit.
-        uint256 maxDeposit_ = $.yieldVault.maxDeposit(address(this));
-
-        // @remind Document.
-        if (exact) require(assets <= maxDeposit_, YieldVaultDepositFailed(assets, maxDeposit_));
-
-        // Set the return value.
-        nonDepositedAssets = assets > maxDeposit_ ? assets - maxDeposit_ : 0;
-
-        // Calculate the amount to deposit into the yield vault.
-        assets = assets > maxDeposit_ ? maxDeposit_ : assets;
-
-        // @remind Document.
-        if (assets == 0) return nonDepositedAssets;
+        // Morpho Vaults V2 return 0 from maxDeposit by design, so the limit is not consulted.
+        // performReversibleYieldVaultDeposit below attempts the deposit and unwinds atomically on failure.
+        if (assets == 0) return 0;
 
         // @remind Document.
         try this.performReversibleYieldVaultDeposit(assets) {}
@@ -1077,19 +1063,14 @@ abstract contract VaultBridgeToken is
     ) internal returns (uint256 nonWithdrawnAssets, uint256 receivedAssets) {
         VaultBridgeTokenStorage storage $ = _getVaultBridgeTokenStorage();
 
-        // Get the yield vault's withdraw limit.
-        uint256 maxWithdraw_ = $.yieldVault.maxWithdraw(address(this));
-
-        // @remind Document.
-        if (exact) require(assets <= maxWithdraw_, YieldVaultWithdrawalFailed(assets, maxWithdraw_));
-
-        // Set a return value.
-        nonWithdrawnAssets = assets > maxWithdraw_ ? assets - maxWithdraw_ : 0;
-
-        // Calculate the amount to withdraw from the yield vault.
-        assets = assets > maxWithdraw_ ? maxWithdraw_ : assets;
-
-        // @remind Document.
+        // Partial-fill clamp, only when capacity is KNOWN and the caller tolerates a short fill.
+        if (!exact) {
+            uint256 capacity = _yieldVaultCapacity();
+            if (capacity != 0 && assets > capacity) {
+                nonWithdrawnAssets = assets - capacity;
+                assets = capacity;
+            }
+        }
         if (assets == 0) return (nonWithdrawnAssets, 0);
 
         // Cache the underlying token balance and yield vault shares balance.
@@ -1098,8 +1079,14 @@ abstract contract VaultBridgeToken is
         if (receiver == address(this)) underlyingTokenBalanceBefore = $.underlyingToken.balanceOf(address(this));
         uint256 yieldVaultSharesBalanceBefore = $.yieldVault.balanceOf(address(this));
 
-        // Withdraw.
-        uint256 burnedYieldVaultShares = $.yieldVault.withdraw(assets, receiver, address(this));
+        // Attempt rather than predict. The lens is an estimate; the vault is the authority.
+        uint256 burnedYieldVaultShares;
+        try $.yieldVault.withdraw(assets, receiver, address(this)) returns (uint256 burned) {
+            burnedYieldVaultShares = burned;
+        } catch {
+            if (exact) revert YieldVaultWithdrawalFailed(assets, _yieldVaultCapacity());
+            return (nonWithdrawnAssets + assets, 0);
+        }
 
         // @remind Redocument.
         // Check the output.
@@ -1117,6 +1104,43 @@ abstract contract VaultBridgeToken is
         // The withdrawn amount is only calculated when the receiver is the vault bridge token.
         receivedAssets =
             receiver == address(this) ? ($.underlyingToken.balanceOf(address(this)) - underlyingTokenBalanceBefore) : 0;
+    }
+
+    /// @notice Sets the liquidity lens used to estimate yield vault withdrawal capacity. address(0) disables it.
+    function setLiquidityLens(address lens) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        _getVaultBridgeTokenStorage().liquidityLens = lens;
+        emit LiquidityLensSet(lens);
+    }
+
+    /// @notice Repoints the Part2 singleton that the fallback delegates to.
+    function setVaultBridgeTokenPart2(address part2) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(part2 != address(0), InvalidVaultBridgeTokenPart2());
+        _getVaultBridgeTokenStorage()._vaultBridgeTokenPart2 = part2;
+        emit VaultBridgeTokenPart2Set(part2);
+    }
+
+    /// @dev Yield vault withdrawal capacity. Returns 0 for "unknown" - never treat 0 as "no liquidity".
+    /// @dev VIEW USE ONLY. Execution paths must attempt and catch instead of consulting this.
+    function _yieldVaultCapacity() internal view returns (uint256) {
+        VaultBridgeTokenStorage storage $ = _getVaultBridgeTokenStorage();
+        IERC4626 vault = $.yieldVault;
+
+        // Compliant vaults (MetaMorpho V1) answer for themselves; the lens is never reached.
+        uint256 reported = vault.maxWithdraw(address(this));
+        if (reported != 0) return reported;
+
+        address lens = $.liquidityLens;
+        if (lens == address(0)) return 0;
+
+        try ILiquidityLens(lens).maxWithdraw(address(vault), address(this)) returns (uint256 fromLens) {
+            // 0 means the lens does not recognise the adapter, not that there is no liquidity.
+            if (fromLens == 0) return 0;
+            // Hard cap: a wrong or hostile lens can never inflate our position.
+            uint256 position = vault.convertToAssets(vault.balanceOf(address(this)));
+            return fromLens < position ? fromLens : position;
+        } catch {
+            return 0;
+        }
     }
 
     // -----================= ::: UNDERLYING TOKEN ::: =================-----
