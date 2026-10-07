@@ -35,7 +35,10 @@ interface IVbUsdc {
     function yieldVaultMaximumSlippagePercentage() external view returns (uint256);
     function convertToAssets(uint256 shares) external pure returns (uint256);
     function hasRole(bytes32 role, address account) external view returns (bool);
+    function maxDeposit(address receiver) external view returns (uint256);
+    function maxMint(address receiver) external view returns (uint256);
     function maxWithdraw(address owner) external view returns (uint256);
+    function maxRedeem(address owner) external view returns (uint256);
     function setVaultBridgeTokenPart2(address part2) external;
     function setLiquidityLens(address lens) external;
     function pause() external;
@@ -141,12 +144,14 @@ contract VbUsdcMorphoForkTest is Test {
         _discoverSafe();
         _deployImplementations();
         _upgrade();
+        _assertMaxOnV1();
         _pause();
         _collectYield();
         _drainYieldVault();
         _switchYieldVault();
         _unpause();
         _rebalanceReserve();
+        _assertMaxOnV2();
         _withdrawFromV2();
         _assertSwapGas();
     }
@@ -166,10 +171,12 @@ contract VbUsdcMorphoForkTest is Test {
         assertEq(prior.lens, address(0));
         assertEq(prior.lxlyBridge, LXLY_BRIDGE);
         assertGt(token.balanceOf(LXLY_BRIDGE), 0, "LxLy bridge holds no vbUSDC");
-        console.log("ok discover: Safe owns ProxyAdmin, holds four roles, unpaused 0.5.0, V1 vault");
-        console.log("  supply", prior.totalSupply);
-        console.log("  reserved", prior.reservedAssets);
-        console.log("  bridge vbUSDC", token.balanceOf(LXLY_BRIDGE));
+        _rule();
+        console.log("discover: Safe owns ProxyAdmin, holds the four roles, unpaused 0.5.0");
+        console.log("  yield vault is MetaMorpho V1");
+        console.log(string.concat("  total supply   ", _usdc(prior.totalSupply)));
+        console.log(string.concat("  reserved       ", _usdc(prior.reservedAssets)));
+        console.log(string.concat("  bridge balance ", _usdc(token.balanceOf(LXLY_BRIDGE))));
     }
 
     function _deployImplementations() internal {
@@ -193,7 +200,8 @@ contract VbUsdcMorphoForkTest is Test {
         assertTrue(implBefore != genericImpl);
         _assertStatePreserved();
         _assertSafeHoldsRoles();
-        console.log("ok upgrade: version 0.6.0, storage and roles unchanged, still on V1");
+        _rule();
+        console.log("upgrade: version 0.6.0, storage and roles unchanged, still on MetaMorpho V1");
 
         _call(USDC_SAFE, VB_USDC, abi.encodeCall(IVbUsdc.setVaultBridgeTokenPart2, (part2)), false);
         _call(USDC_SAFE, VB_USDC, abi.encodeCall(IVbUsdc.setLiquidityLens, (lens)), false);
@@ -202,15 +210,44 @@ contract VbUsdcMorphoForkTest is Test {
         assertEq(_loadAddress(LENS_SLOT), lens);
         assertEq(token.yieldVault(), prior.yieldVault);
         assertFalse(token.paused());
-        assertGt(token.maxWithdraw(LXLY_BRIDGE), 0);
-        console.log("ok setters: new Part2 and lens, maxWithdraw", token.maxWithdraw(LXLY_BRIDGE));
+        console.log("setters: new Part2 and liquidity lens installed, yield vault unchanged");
+    }
+
+    /// @dev Ops check before the swap. A non-zero V1 maxWithdraw means the lens is not consulted.
+    function _assertMaxOnV1() internal view {
+        IVbUsdc token = _token();
+        assertEq(token.maxDeposit(LXLY_BRIDGE), type(uint256).max);
+        assertEq(token.maxMint(LXLY_BRIDGE), type(uint256).max);
+        uint256 maxWithdraw_ = token.maxWithdraw(LXLY_BRIDGE);
+        uint256 maxRedeem_ = token.maxRedeem(LXLY_BRIDGE);
+        assertGt(maxWithdraw_, 0);
+        assertGt(maxRedeem_, 0);
+
+        uint256 v1Liquid = IYieldVault(V1_VAULT).maxWithdraw(VB_USDC);
+        _rule();
+        console.log("before the swap, still on V1 and unpaused");
+        console.log("  maxDeposit and maxMint are unlimited");
+        console.log(string.concat("  bridge maxWithdraw ", _usdc(maxWithdraw_)));
+        console.log(string.concat("  bridge maxRedeem   ", _usdc(maxRedeem_)));
+        console.log(string.concat("  V1 maxWithdraw of the vbUSDC position ", _usdc(v1Liquid)));
+        if (v1Liquid > 0) {
+            console.log("V1 reported liquidity, so the lens was not consulted");
+        } else {
+            console.log("V1 reports 0, so a non-zero bridge maxWithdraw came from the lens");
+        }
     }
 
     function _pause() internal {
         _swap(abi.encodeCall(IVbUsdc.pause, ()));
-        assertTrue(_token().paused());
-        assertEq(_token().maxWithdraw(LXLY_BRIDGE), 0);
-        console.log("ok pause: paused, maxWithdraw is 0");
+        IVbUsdc token = _token();
+        assertTrue(token.paused());
+        assertEq(token.maxDeposit(LXLY_BRIDGE), 0);
+        assertEq(token.maxMint(LXLY_BRIDGE), 0);
+        assertEq(token.maxWithdraw(LXLY_BRIDGE), 0);
+        assertEq(token.maxRedeem(LXLY_BRIDGE), 0);
+        _rule();
+        console.log("pause: token is paused");
+        console.log("maxDeposit, maxMint, maxWithdraw, and maxRedeem are 0 because of the pause, not an empty vault");
     }
 
     function _collectYield() internal {
@@ -223,14 +260,16 @@ contract VbUsdcMorphoForkTest is Test {
             vm.expectRevert(IVbUsdc.NoYield.selector);
             vm.prank(USDC_SAFE);
             token.collectYield();
-            console.log("ok collectYield: no yield, call reverts NoYield");
+            _rule();
+            console.log("collectYield: no yield, call reverts NoYield");
             return;
         }
 
         _swap(abi.encodeCall(IVbUsdc.collectYield, ()));
         assertEq(token.balanceOf(recipient), balanceBefore + outstanding);
         assertEq(token.yield(), 0);
-        console.log("ok collectYield: minted", outstanding);
+        _rule();
+        console.log(string.concat("collectYield: minted ", _usdc(outstanding), " of vbUSDC to the yield recipient"));
     }
 
     function _drainYieldVault() internal {
@@ -246,10 +285,13 @@ contract VbUsdcMorphoForkTest is Test {
         assertEq(token.stakedAssets(), 0);
         assertGt(token.reservedAssets(), reservedBefore);
         assertGe(IERC20(USDC).balanceOf(VB_USDC), token.reservedAssets());
-        console.log("ok drain: V1 shares 0, reserved", token.reservedAssets());
+        _rule();
+        console.log("drain: V1 shares are 0");
+        console.log(string.concat("  reserved ", _usdc(token.reservedAssets())));
     }
 
     function _switchYieldVault() internal {
+        _rule();
         _assertV2GatesOpen();
         address oldVault = _token().yieldVault();
 
@@ -258,13 +300,14 @@ contract VbUsdcMorphoForkTest is Test {
         assertEq(_token().yieldVault(), STEAKHOUSE_USDC);
         assertEq(IERC20(USDC).allowance(VB_USDC, oldVault), 0);
         assertEq(IERC20(USDC).allowance(VB_USDC, STEAKHOUSE_USDC), type(uint256).max);
-        console.log("ok setYieldVault: Steakhouse, old allowance 0, new allowance max");
+        console.log("setYieldVault: Steakhouse, old allowance cleared, new allowance is max");
     }
 
     function _unpause() internal {
         _swap(abi.encodeCall(IVbUsdc.unpause, ()));
         assertFalse(_token().paused());
-        console.log("ok unpause");
+        _rule();
+        console.log("unpause: token is unpaused");
     }
 
     function _rebalanceReserve() internal {
@@ -283,10 +326,34 @@ contract VbUsdcMorphoForkTest is Test {
         assertGt(IYieldVault(STEAKHOUSE_USDC).balanceOf(VB_USDC), 0);
         assertEq(IERC20(USDC).balanceOf(STEAKHOUSE_USDC), idleBefore);
         assertGe(token.stakedAssets() - stakedBefore, Math.mulDiv(deposited, 1e18 - prior.slippage, 1e18));
-        console.log("ok rebalance: deposited", deposited);
-        console.log("  reserved", token.reservedAssets());
-        console.log("  staked", token.stakedAssets());
-        console.log("  idle unchanged", idleBefore);
+        _rule();
+        console.log(string.concat("rebalance: deposited ", _usdc(deposited), " into Steakhouse"));
+        console.log(string.concat("  reserved ", _usdc(token.reservedAssets())));
+        console.log(string.concat("  staked   ", _usdc(token.stakedAssets())));
+        console.log(string.concat("  Steakhouse idle unchanged ", _usdc(idleBefore)));
+    }
+
+    /// @dev After the swap the vault's own maxWithdraw is 0, so a non-zero bridge reading came from the lens.
+    function _assertMaxOnV2() internal view {
+        IVbUsdc token = _token();
+        assertEq(IYieldVault(STEAKHOUSE_USDC).maxWithdraw(VB_USDC), 0);
+        assertEq(token.maxDeposit(LXLY_BRIDGE), type(uint256).max);
+        assertEq(token.maxMint(LXLY_BRIDGE), type(uint256).max);
+        uint256 maxWithdraw_ = token.maxWithdraw(LXLY_BRIDGE);
+        uint256 maxRedeem_ = token.maxRedeem(LXLY_BRIDGE);
+        assertGt(maxWithdraw_, 0, "lens did not give the bridge a maxWithdraw");
+        assertGt(maxRedeem_, 0, "lens did not give the bridge a maxRedeem");
+        uint256 fromLens = VaultBridgeLiquidityLens(lens).maxWithdraw(STEAKHOUSE_USDC, VB_USDC);
+        assertLe(maxWithdraw_, fromLens, "bridge maxWithdraw exceeds the lens");
+        assertGe(maxWithdraw_, EXIT_ASSETS, "exit is larger than bridge maxWithdraw");
+
+        _rule();
+        console.log("after rebalance, on Steakhouse: the vault maxWithdraw is 0, so the lens answers");
+        console.log("  maxDeposit and maxMint are unlimited");
+        console.log(string.concat("  bridge maxWithdraw ", _usdc(maxWithdraw_)));
+        console.log(string.concat("  bridge maxRedeem   ", _usdc(maxRedeem_)));
+        console.log(string.concat("  lens maxWithdraw   ", _usdc(fromLens)));
+        console.log(string.concat("  exit of ", _usdc(EXIT_ASSETS), " is within bridge maxWithdraw"));
     }
 
     function _withdrawFromV2() internal {
@@ -298,23 +365,25 @@ contract VbUsdcMorphoForkTest is Test {
         uint256 idleBefore = IERC20(USDC).balanceOf(STEAKHOUSE_USDC);
         uint256 sharesBefore = IYieldVault(STEAKHOUSE_USDC).balanceOf(VB_USDC);
         assertLt(idleBefore, EXIT_ASSETS);
-        console.log("ok withdraw preconditions: bridge covers exit, idle", idleBefore);
 
         _call(LXLY_BRIDGE, VB_USDC, abi.encodeCall(IVbUsdc.withdraw, (EXIT_ASSETS, receiver, LXLY_BRIDGE)), false);
 
         assertEq(IERC20(USDC).balanceOf(receiver), receiverBefore + EXIT_ASSETS);
         assertEq(IERC20(USDC).balanceOf(STEAKHOUSE_USDC), idleBefore);
         assertLt(IYieldVault(STEAKHOUSE_USDC).balanceOf(VB_USDC), sharesBefore);
-        console.log("ok withdraw: receiver got", EXIT_ASSETS);
-        console.log("  V2 shares before", sharesBefore);
-        console.log("  V2 shares after", IYieldVault(STEAKHOUSE_USDC).balanceOf(VB_USDC));
+        _rule();
+        console.log(string.concat("withdraw ", _usdc(EXIT_ASSETS), " through the Steakhouse adapter"));
+        console.log(string.concat("  receiver got ", _usdc(EXIT_ASSETS)));
+        console.log(string.concat("  V2 shares before ", _grouped(sharesBefore)));
+        console.log(string.concat("  V2 shares after  ", _grouped(IYieldVault(STEAKHOUSE_USDC).balanceOf(VB_USDC))));
+        console.log(string.concat("  Steakhouse idle unchanged ", _usdc(idleBefore)));
     }
 
     function _assertSwapGas() internal view {
         assertLt(swapGas, SWAP_GAS_CEILING);
-        console.log("ok gas: calls", swapCalls);
-        console.log("  gas", swapGas);
-        console.log("  ceiling", SWAP_GAS_CEILING);
+        _rule();
+        console.log(string.concat("gas: ", _digits(swapCalls), " vault-swap calls used ", _grouped(swapGas)));
+        console.log(string.concat("  ceiling ", _grouped(SWAP_GAS_CEILING)));
     }
 
     /// @dev Logs whether the V1 vault can pay a full redeem. Does not revert.
@@ -325,20 +394,21 @@ contract VbUsdcMorphoForkTest is Test {
         (bool withdrawOk, bytes memory withdrawData) =
             vault.staticcall(abi.encodeCall(IYieldVault.maxWithdraw, (VB_USDC)));
 
+        _rule();
         if (!redeemOk || !withdrawOk || redeemData.length < 32 || withdrawData.length < 32) {
-            console.log("WARNING: could not read V1 liquidity; continuing to drain");
+            console.log("WARNING: could not read V1 liquidity; the drain still runs");
             return;
         }
 
         uint256 owed = abi.decode(redeemData, (uint256));
         uint256 liquid = abi.decode(withdrawData, (uint256));
         if (liquid >= owed) {
-            console.log("vbUSDC V1 position is fully liquid");
+            console.log("V1 position is fully liquid");
         } else {
-            console.log("WARNING: vbUSDC V1 position is illiquid");
+            console.log("WARNING: V1 position is illiquid; the drain still runs");
         }
-        console.log("maxWithdraw", liquid);
-        console.log("previewRedeem", owed);
+        console.log(string.concat("  V1 maxWithdraw ", _usdc(liquid)));
+        console.log(string.concat("  previewRedeem  ", _usdc(owed)));
     }
 
     function _assertV2GatesOpen() internal view {
@@ -348,7 +418,7 @@ contract VbUsdcMorphoForkTest is Test {
         assertEq(vault.sendSharesGate(), address(0));
         assertEq(vault.receiveAssetsGate(), address(0));
         assertEq(vault.sendAssetsGate(), address(0));
-        console.log("ok gates: Steakhouse asset is USDC, all four gates open");
+        console.log("gates: Steakhouse asset is USDC, all four gates are open");
     }
 
     function _assertSafeHoldsRoles() internal view {
@@ -419,6 +489,62 @@ contract VbUsdcMorphoForkTest is Test {
         assembly {
             revert(add(ret, 32), mload(ret))
         }
+    }
+
+    function _rule() internal pure {
+        console.log("-----");
+    }
+
+    /// @dev USDC and vbUSDC use 6 decimals. Logs print whole units so the raw base units are not compared by eye.
+    function _usdc(uint256 amount) private pure returns (string memory) {
+        return string.concat(_grouped(amount / 1e6), ".", _frac6(amount % 1e6), " USDC");
+    }
+
+    function _grouped(uint256 value) private pure returns (string memory) {
+        if (value == 0) return "0";
+        bytes memory digits = bytes(_digits(value));
+        uint256 len = digits.length;
+        uint256 commas = (len - 1) / 3;
+        bytes memory out = new bytes(len + commas);
+        uint256 cursor = out.length;
+        uint256 sinceComma;
+        for (uint256 i = len; i > 0; i--) {
+            cursor--;
+            out[cursor] = digits[i - 1];
+            sinceComma++;
+            if (sinceComma == 3 && i > 1) {
+                cursor--;
+                out[cursor] = ",";
+                sinceComma = 0;
+            }
+        }
+        return string(out);
+    }
+
+    function _frac6(uint256 frac) private pure returns (string memory) {
+        bytes memory out = new bytes(6);
+        for (uint256 i = 6; i > 0; i--) {
+            out[i - 1] = bytes1(uint8(48 + (frac % 10)));
+            frac /= 10;
+        }
+        return string(out);
+    }
+
+    function _digits(uint256 value) private pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 count;
+        while (temp != 0) {
+            count++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(count);
+        while (value != 0) {
+            count--;
+            buffer[count] = bytes1(uint8(48 + (value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
     }
 
     function _token() private pure returns (IVbUsdc) {
