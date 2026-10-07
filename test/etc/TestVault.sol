@@ -14,8 +14,10 @@ contract TestVault {
     IERC20 public asset;
     uint256 public slippageAmount;
     bool public slippage;
+    bool public enforceLimits;
 
     mapping(address => uint256) public balanceOf;
+    uint256 private _maxRedeem;
 
     constructor(address _asset) {
         asset = IERC20(_asset);
@@ -27,6 +29,10 @@ contract TestVault {
 
     function convertToShares(uint256 amount) external pure returns (uint256) {
         return amount;
+    }
+
+    function setEnforceLimits(bool v) external {
+        enforceLimits = v;
     }
 
     function setSlippage(bool _slippage, uint256 _slippageAmount) external {
@@ -46,6 +52,10 @@ contract TestVault {
         _maxWithdraw = amount;
     }
 
+    function setMaxRedeem(uint256 amount) external {
+        _maxRedeem = amount;
+    }
+
     function maxDeposit(address user) external view returns (uint256) {
         // silence the compiler
         {
@@ -62,7 +72,12 @@ contract TestVault {
         return _maxWithdraw;
     }
 
+    function maxRedeem(address) external view returns (uint256) {
+        return _maxRedeem;
+    }
+
     function deposit(uint256 amount, address user) external payable returns (uint256) {
+        if (enforceLimits) require(amount <= _maxDeposit, "TestVault: Deposit limit");
         if (slippage) {
             require(amount > slippageAmount, "TestVault: Slippage amount is too high");
             _receiveAssets(amount - slippageAmount, user);
@@ -73,6 +88,7 @@ contract TestVault {
     }
 
     function withdraw(uint256 amount, address receiver, address user) external returns (uint256) {
+        if (enforceLimits) require(amount <= _maxWithdraw, "TestVault: Withdraw limit");
         require(balanceOf[user] >= amount, "TestVault: Insufficient balance");
         _sendAssets(amount, receiver, user);
         if (slippage) {
@@ -80,6 +96,18 @@ contract TestVault {
             return amount + slippageAmount;
         } else {
             return amount;
+        }
+    }
+
+    function redeem(uint256 shares, address receiver, address user) external returns (uint256) {
+        if (enforceLimits) require(shares <= _maxRedeem, "TestVault: Redeem limit");
+        require(balanceOf[user] >= shares, "TestVault: Insufficient balance");
+        _sendAssets(shares, receiver, user);
+        if (slippage) {
+            require(shares > slippageAmount, "TestVault: Slippage amount is too high");
+            return shares + slippageAmount;
+        } else {
+            return shares;
         }
     }
 
