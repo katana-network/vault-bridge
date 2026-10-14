@@ -262,6 +262,8 @@ contract VaultBridgeTokenPart2 is VaultBridgeToken {
 
         try $.yieldVault.redeem(shares, address(this), address(this)) returns (uint256) {}
         catch {
+            // The second argument is withdrawable assets from `_yieldVaultCapacity()`, not a share limit.
+            // `redemptionLimit` used to be `maxRedeem`. Morpho Vault V2 hardcodes `maxRedeem` to 0.
             if (exact) revert YieldVaultRedemptionFailed(shares, _yieldVaultCapacity());
             return;
         }

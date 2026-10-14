@@ -131,6 +131,8 @@ abstract contract VaultBridgeToken is
     error NoYield();
     error InvalidOriginNetwork();
     error CannotCompleteMigration(uint256 requiredAssets, uint256 receivedAssets, uint256 assetsInMigrationFund);
+    /// @dev `redemptionLimit` is withdrawable assets from `_yieldVaultCapacity()`, not a share limit.
+    ///      The name is unchanged. It used to be `maxRedeem`. Morpho Vault V2 hardcodes `maxRedeem` to 0.
     error YieldVaultRedemptionFailed(uint256 sharesToRedeem, uint256 redemptionLimit);
     error MinimumYieldVaultDepositNotMet(uint256 assetsToDeposit, uint256 minimumYieldVaultDeposit);
     error YieldVaultDepositFailed(uint256 assetsToDeposit, uint256 depositLimit);
@@ -980,9 +982,6 @@ abstract contract VaultBridgeToken is
             return assets;
         }
 
-        // @remind Document.
-        uint256 originalAssets = assets;
-
         // Morpho Vaults V2 return 0 from maxDeposit by design, so the limit is not consulted.
         // performReversibleYieldVaultDeposit below attempts the deposit and unwinds atomically on failure.
         if (assets == 0) return 0;
@@ -999,7 +998,7 @@ abstract contract VaultBridgeToken is
                         revert(add(32, depositData), mload(depositData))
                     }
                 } else {
-                    return originalAssets;
+                    return assets;
                 }
             }
 
@@ -1008,7 +1007,7 @@ abstract contract VaultBridgeToken is
                     uint256 mintedYieldVaultShares = abi.decode(depositData, (uint256));
                     revert InsufficientYieldVaultSharesMinted(assets, mintedYieldVaultShares);
                 } else {
-                    return originalAssets;
+                    return assets;
                 }
             }
 
@@ -1106,7 +1105,10 @@ abstract contract VaultBridgeToken is
             receiver == address(this) ? ($.underlyingToken.balanceOf(address(this)) - underlyingTokenBalanceBefore) : 0;
     }
 
-    /// @notice Sets the liquidity lens used to estimate yield vault withdrawal capacity. address(0) disables it.
+    /// @notice Sets the liquidity lens used to estimate yield vault withdrawal capacity.
+    /// @dev address(0) unsets the lens. When the yield vault's `maxWithdraw` is non-zero, capacity comes from
+    ///      the vault and the lens is not called. When `maxWithdraw` is 0, an unset lens leaves capacity unknown,
+    ///      so a non-exact withdrawal skips the short-fill clamp and attempts the full amount.
     function setLiquidityLens(address lens) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
         _getVaultBridgeTokenStorage().liquidityLens = lens;
         emit LiquidityLensSet(lens);
@@ -1119,8 +1121,9 @@ abstract contract VaultBridgeToken is
         emit VaultBridgeTokenPart2Set(part2);
     }
 
-    /// @dev Yield vault withdrawal capacity. Returns 0 for "unknown" - never treat 0 as "no liquidity".
-    /// @dev VIEW USE ONLY. Execution paths must attempt and catch instead of consulting this.
+    /// @dev Yield vault withdrawal capacity in assets. Returns 0 for "unknown". Never treat 0 as "no liquidity".
+    /// @dev A non-exact withdrawal uses a non-zero result to clamp a short fill, then still calls the vault.
+    ///      An exact withdrawal calls the vault first and attaches this number to the revert if that call fails.
     function _yieldVaultCapacity() internal view returns (uint256) {
         VaultBridgeTokenStorage storage $ = _getVaultBridgeTokenStorage();
         IERC4626 vault = $.yieldVault;
