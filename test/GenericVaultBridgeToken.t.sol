@@ -79,7 +79,7 @@ contract GenericVaultBridgeTokenTest is Test {
 
         asset = TEST_TOKEN;
         vbTokenVault = new TestVault(asset);
-        version = "0.5.0";
+        version = "0.6.0";
         name = "Vault Bridge USDC";
         symbol = "vbUSDC";
         decimals = 6;
@@ -89,6 +89,7 @@ contract GenericVaultBridgeTokenTest is Test {
 
         vbTokenVault.setMaxDeposit(MAX_DEPOSIT);
         vbTokenVault.setMaxWithdraw(MAX_WITHDRAW);
+        vbTokenVault.setEnforceLimits(true);
 
         // deploy the vbToken part 2
         vbTokenPart2 = new VaultBridgeTokenPart2();
@@ -297,12 +298,11 @@ contract GenericVaultBridgeTokenTest is Test {
 
         vm.stopPrank();
 
-        // since max deposit is reached, the reserve amount should be calculated based on the max deposit limit
-        uint256 reserveAssetsAfterDeposit = _calculateReserveAssets(amount, vaultMaxDeposit);
-
-        assertEq(IERC20(asset).balanceOf(address(vbToken)), reserveAssetsAfterDeposit); // reserve assets increased
-        assertGt(vbTokenVault.balanceOf(address(vbToken)), 0); // shares locked in the vault
-        assertEq(vbToken.balanceOf(recipient), sharesToBeMinted); // shares minted to the recipient
+        // Vault refused the over-cap deposit; the whole amount stays in reserve (all-or-nothing).
+        assertEq(IERC20(asset).balanceOf(address(vbToken)), amount);
+        assertEq(vbToken.reservedAssets(), amount);
+        assertEq(vbTokenVault.balanceOf(address(vbToken)), 0);
+        assertEq(vbToken.balanceOf(recipient), sharesToBeMinted);
     }
 
     function test_deposit_exceeds_max_and_reserve_above_threshold() public {
@@ -331,13 +331,11 @@ contract GenericVaultBridgeTokenTest is Test {
 
         vm.stopPrank();
 
-        // since the reserve percentage is above the threshold, the reserve amount should be calculated based on the rebalanced amount
-        uint256 newAmount = reserveAssetsAfterDeposit;
-        uint256 finalReserveAssets = _calculateReserveAssets(newAmount, MAX_DEPOSIT);
-
-        assertEq(IERC20(asset).balanceOf(address(vbToken)), finalReserveAssets); // reserve assets increased
-        assertGt(vbTokenVault.balanceOf(address(vbToken)), 0); // shares locked in the vault
-        assertEq(vbToken.balanceOf(recipient), sharesToBeMinted); // shares minted to the recipient
+        // Both the deposit into the vault and the inline rebalance are refused; the full amount stays in reserve.
+        assertEq(IERC20(asset).balanceOf(address(vbToken)), amount);
+        assertEq(vbToken.reservedAssets(), amount);
+        assertEq(vbTokenVault.balanceOf(address(vbToken)), 0);
+        assertEq(vbToken.balanceOf(recipient), sharesToBeMinted);
     }
 
     function test_deposit_amount_lt_max_deposit() public {
@@ -567,10 +565,11 @@ contract GenericVaultBridgeTokenTest is Test {
         assertEq(IERC20(asset).balanceOf(sender), 0); // make sure sender has deposited all assets
         assertEq(vbToken.balanceOf(sender), amountGtMaxWithdraw);
 
-        uint256 withdrawableAmount = _calculateWithdrawableAmount(amountGtMaxWithdraw);
-        uint256 availableAmount = vbToken.reservedAssets() + withdrawableAmount;
+        uint256 remainingAfterReserve = (amountGtMaxWithdraw + 1) - vbToken.reservedAssets();
         vm.expectRevert(
-            abi.encodeWithSelector(VaultBridgeToken.AssetsTooLarge.selector, availableAmount, amountGtMaxWithdraw + 1)
+            abi.encodeWithSelector(
+                VaultBridgeToken.YieldVaultWithdrawalFailed.selector, remainingAfterReserve, MAX_WITHDRAW
+            )
         );
         vbToken.withdraw(amountGtMaxWithdraw + 1, sender, sender);
 
@@ -585,7 +584,12 @@ contract GenericVaultBridgeTokenTest is Test {
         assertEq(IERC20(asset).balanceOf(sender), 0); // make sure sender has deposited all assets
         assertEq(vbToken.balanceOf(sender), amountLtMaxWithdraw);
 
-        vm.expectRevert("TestVault: Insufficient balance");
+        remainingAfterReserve = (amountLtMaxWithdraw + 1) - vbToken.reservedAssets();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VaultBridgeToken.YieldVaultWithdrawalFailed.selector, remainingAfterReserve, MAX_WITHDRAW
+            )
+        );
         vbToken.withdraw(amountLtMaxWithdraw + 1, sender, sender);
 
         vm.revertToState(stateBeforeDeposit);
@@ -675,7 +679,7 @@ contract GenericVaultBridgeTokenTest is Test {
 
     function test_rebalanceReserve_below() public virtual {
         uint256 vaultMaxDeposit = vbTokenVault.maxDeposit(address(vbToken));
-        uint256 amount = (vaultMaxDeposit * 10) / 9 + 1; // account for the minimum reserve percentage and add to make the amount greater than the max deposit limit
+        uint256 amount = vaultMaxDeposit / 2;
         assertGt(amount, MINIMUM_YIELD_VAULT_DEPOSIT, "Amount should be greater than the minimum deposit.");
 
         uint256 totalSupply;
@@ -952,11 +956,9 @@ contract GenericVaultBridgeTokenTest is Test {
         vm.prank(migrationManager);
         vbTokenPart2.completeMigration(NETWORK_ID_L2, shares, amount);
 
-        // since max deposit is reached, the reserve amount should be calculated based on the max deposit limit
-        uint256 reserveAssetsAfterDeposit = _calculateReserveAssets(amount, vaultMaxDeposit);
-
-        assertEq(vbToken.reservedAssets(), reserveAssetsAfterDeposit);
-        assertGt(vbToken.stakedAssets(), stakedAssetsBefore);
+        assertEq(vbToken.reservedAssets(), amount);
+        assertEq(vbToken.stakedAssets(), stakedAssetsBefore);
+        assertEq(vbTokenVault.balanceOf(address(vbToken)), 0);
     }
 
     function test_completeMigration_with_discrepancy() public {
